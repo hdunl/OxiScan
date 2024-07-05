@@ -1,16 +1,17 @@
 extern crate winapi;
-
-use winapi::um::tlhelp32::{CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS};
-use winapi::um::handleapi::INVALID_HANDLE_VALUE;
-use winapi::um::memoryapi::{ReadProcessMemory, WriteProcessMemory};
-use winapi::um::processthreadsapi::OpenProcess;
-use winapi::um::winnt::{HANDLE, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_VM_OPERATION};
-use std::ffi::CStr;
-use std::os::raw::c_char;
-use std::mem;
-use std::io::{self, Write};
 use ansi_term::Colour::{Blue, Cyan, Green, Red, Yellow};
 use ansi_term::Style;
+use std::ffi::CStr;
+use std::io::{self, Write};
+use std::mem;
+use std::os::raw::c_char;
+use std::ptr;
+use winapi::shared::minwindef::DWORD;
+use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+use winapi::um::memoryapi::{ReadProcessMemory, VirtualQueryEx};
+use winapi::um::processthreadsapi::OpenProcess;
+use winapi::um::tlhelp32::{CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS};
+use winapi::um::winnt::{HANDLE, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, PROCESS_ALL_ACCESS};
 
 fn enumerate_processes() -> Vec<(u32, String)> {
     let mut processes = Vec::new();
@@ -32,7 +33,9 @@ fn enumerate_processes() -> Vec<(u32, String)> {
 
             if Process32First(snapshot, &mut process_entry) != 0 {
                 loop {
-                    let exe_name = CStr::from_ptr(process_entry.szExeFile.as_ptr() as *const c_char).to_string_lossy().into_owned();
+                    let exe_name = CStr::from_ptr(process_entry.szExeFile.as_ptr() as *const c_char)
+                        .to_string_lossy()
+                        .into_owned();
                     processes.push((process_entry.th32ProcessID, exe_name));
 
                     if Process32Next(snapshot, &mut process_entry) == 0 {
@@ -46,29 +49,31 @@ fn enumerate_processes() -> Vec<(u32, String)> {
     processes
 }
 
-fn open_process(pid: u32) -> Option<HANDLE> {
+fn open_process(pid: u32) -> Result<HANDLE, String> {
     unsafe {
-        let handle = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, 0, pid);
+        let handle = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
         if handle.is_null() {
-            None
+            Err(format!("Failed to open process. Error code: {}", winapi::um::errhandlingapi::GetLastError()))
         } else {
-            Some(handle)
+            Ok(handle)
         }
     }
 }
 
 fn read_memory(process_handle: HANDLE, address: usize, buffer: &mut [u8]) -> bool {
     unsafe {
-        ReadProcessMemory(process_handle, address as *const _, buffer.as_mut_ptr() as *mut _, buffer.len(), std::ptr::null_mut()) != 0
+        let mut bytes_read: usize = 0;
+        ReadProcessMemory(
+            process_handle,
+            address as *const _,
+            buffer.as_mut_ptr() as *mut _,
+            buffer.len(),
+            &mut bytes_read,
+        ) != 0 && bytes_read == buffer.len()
     }
 }
 
-fn write_memory(process_handle: HANDLE, address: usize, buffer: &[u8]) -> bool {
-    unsafe {
-        WriteProcessMemory(process_handle, address as *mut _, buffer.as_ptr() as *const _, buffer.len(), std::ptr::null_mut()) != 0
-    }
-}
-
+#[derive(Debug, Clone, Copy)]
 enum ValueType {
     Byte,
     Word,
@@ -96,10 +101,9 @@ fn scan_memory(process_handle: HANDLE, value_type: ValueType, value: &[u8]) -> V
     };
 
     loop {
-        let mut bytes_read = 0;
-        let mut mem_info = winapi::um::winnt::MEMORY_BASIC_INFORMATION {
-            BaseAddress: std::ptr::null_mut(),
-            AllocationBase: std::ptr::null_mut(),
+        let mut mem_info = MEMORY_BASIC_INFORMATION {
+            BaseAddress: ptr::null_mut(),
+            AllocationBase: ptr::null_mut(),
             AllocationProtect: 0,
             RegionSize: 0,
             State: 0,
@@ -107,11 +111,11 @@ fn scan_memory(process_handle: HANDLE, value_type: ValueType, value: &[u8]) -> V
             Type: 0,
         };
         let result = unsafe {
-            winapi::um::memoryapi::VirtualQueryEx(
+            VirtualQueryEx(
                 process_handle,
                 address as *const _,
                 &mut mem_info,
-                std::mem::size_of::<winapi::um::winnt::MEMORY_BASIC_INFORMATION>(),
+                mem::size_of::<MEMORY_BASIC_INFORMATION>(),
             )
         };
 
@@ -119,43 +123,108 @@ fn scan_memory(process_handle: HANDLE, value_type: ValueType, value: &[u8]) -> V
             break;
         }
 
-        if mem_info.State == winapi::um::winnt::MEM_COMMIT
-            && (mem_info.Protect & winapi::um::winnt::PAGE_GUARD) == 0
-            && mem_info.Protect != winapi::um::winnt::PAGE_NOACCESS
+        if mem_info.State == MEM_COMMIT
+            && (mem_info.Protect & PAGE_GUARD) == 0
+            && mem_info.Protect != PAGE_NOACCESS
+            && (mem_info.Protect & winapi::um::winnt::PAGE_READONLY != 0
+            || mem_info.Protect & winapi::um::winnt::PAGE_READWRITE != 0
+            || mem_info.Protect & winapi::um::winnt::PAGE_EXECUTE_READ != 0
+            || mem_info.Protect & winapi::um::winnt::PAGE_EXECUTE_READWRITE != 0)
         {
-            if read_memory(process_handle, address, &mut buffer) {
-                unsafe {
-                    ReadProcessMemory(
-                        process_handle,
-                        address as *const _,
-                        buffer.as_mut_ptr() as *mut _,
-                        buffer.len(),
-                        &mut bytes_read,
-                    );
-                }
-                // println!("Read {} bytes at address 0x{:X}", bytes_read, address);
+            let mut current_address = mem_info.BaseAddress as usize;
+            let end_address = current_address + mem_info.RegionSize;
 
-                if bytes_read == 0 {
-                    break;
-                }
+            while current_address < end_address {
+                let bytes_to_read = (end_address - current_address).min(buffer.len());
+                buffer.resize(bytes_to_read, 0);
 
-                for i in 0..=bytes_read.saturating_sub(value_size) {
-                    let slice = &buffer[i..i + value_size];
-                    if slice == value {
-                        addresses.push(address + i);
-                        println!(
-                            "Found match at address 0x{:X} for value {:?}",
-                            address + i,
-                            value
-                        );
+                if read_memory(process_handle, current_address, &mut buffer) {
+                    for i in 0..=buffer.len().saturating_sub(value_size) {
+                        let slice = &buffer[i..i + value_size];
+                        match value_type {
+                            ValueType::Byte | ValueType::Word | ValueType::Dword | ValueType::Qword => {
+                                if slice == value {
+                                    addresses.push(current_address + i);
+                                    println!(
+                                        "Found match at address 0x{:X} for value {:?}",
+                                        current_address + i,
+                                        value
+                                    );
+                                }
+                            }
+                            ValueType::Float => {
+                                if slice.len() == 4 {
+                                    let scanned_value = unsafe { *(slice.as_ptr() as *const f32) };
+                                    let target_value = unsafe { *(value.as_ptr() as *const f32) };
+                                    if (scanned_value - target_value).abs() < 0.0001 {
+                                        addresses.push(current_address + i);
+                                        println!(
+                                            "Found approximate match at address 0x{:X} for value {:.6}",
+                                            current_address + i,
+                                            scanned_value
+                                        );
+                                    }
+                                }
+                            }
+                            ValueType::Double => {
+                                if slice.len() == 8 {
+                                    let scanned_value = unsafe { *(slice.as_ptr() as *const f64) };
+                                    let target_value = unsafe { *(value.as_ptr() as *const f64) };
+                                    if (scanned_value - target_value).abs() < 0.000001 {
+                                        addresses.push(current_address + i);
+                                        println!(
+                                            "Found approximate match at address 0x{:X} for value {:.8}",
+                                            current_address + i,
+                                            scanned_value
+                                        );
+                                    }
+                                }
+                            }
+                            ValueType::String => {
+                                if slice.windows(value.len()).any(|window| window == value) {
+                                    addresses.push(current_address + i);
+                                    println!(
+                                        "Found UTF-8 match at address 0x{:X} for value {:?}",
+                                        current_address + i,
+                                        value
+                                    );
+                                }
+
+                                // UTF-16 search
+                                let utf16_value: Vec<u16> = String::from_utf8_lossy(value)
+                                    .encode_utf16()
+                                    .collect();
+                                let utf16_bytes: Vec<u8> = utf16_value
+                                    .iter()
+                                    .flat_map(|&b| b.to_ne_bytes())
+                                    .collect();
+                                if slice.windows(utf16_bytes.len()).any(|window| window == utf16_bytes) {
+                                    addresses.push(current_address + i);
+                                    println!(
+                                        "Found UTF-16 match at address 0x{:X} for value {:?}",
+                                        current_address + i,
+                                        String::from_utf16_lossy(&utf16_value)
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
+                current_address += bytes_to_read;
             }
         }
         address = (mem_info.BaseAddress as usize) + mem_info.RegionSize;
     }
 
     addresses
+}
+
+fn get_user_input<T: std::str::FromStr>(prompt: &str) -> Result<T, String> {
+    print!("{}", prompt);
+    io::stdout().flush().unwrap();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).map_err(|e| e.to_string())?;
+    input.trim().parse().map_err(|_| "Invalid input".to_string())
 }
 
 fn main() {
@@ -165,70 +234,137 @@ fn main() {
         println!("Process ID: {}, Process Name: {}", Yellow.paint(pid.to_string()), Cyan.paint(name));
     }
 
-    print!("Enter the process ID to scan: ");
-    io::stdout().flush().unwrap();
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
-    let pid = input.trim().parse::<u32>().unwrap();
+    let pid: u32 = match get_user_input("Enter the process ID to scan: ") {
+        Ok(id) => id,
+        Err(e) => {
+            println!("{}", Red.paint(format!("Error: {}", e)));
+            return;
+        }
+    };
 
-    if let Some(process_handle) = open_process(pid) {
-        println!("{}", Green.paint("Process opened successfully."));
+    match open_process(pid) {
+        Ok(process_handle) => {
+            println!("{}", Green.paint("Process opened successfully."));
 
-        loop {
-            println!("\n{}", Style::new().bold().fg(Blue).paint("Select the value type to scan for:"));
-            println!("1. Byte");
-            println!("2. Word (2 bytes)");
-            println!("3. Dword (4 bytes)");
-            println!("4. Qword (8 bytes)");
-            println!("5. Float");
-            println!("6. Double");
-            println!("7. String");
+            loop {
+                println!("\n{}", Style::new().bold().fg(Blue).paint("Select the value type to scan for:"));
+                println!("1. Byte");
+                println!("2. Word (2 bytes)");
+                println!("3. Dword (4 bytes)");
+                println!("4. Qword (8 bytes)");
+                println!("5. Float");
+                println!("6. Double");
+                println!("7. String");
 
-            print!("Enter your choice (1-7): ");
-            io::stdout().flush().unwrap();
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).unwrap();
-            let choice = input.trim().parse::<u32>().unwrap();
+                let choice: u32 = match get_user_input("Enter your choice (1-7): ") {
+                    Ok(c) => c,
+                    Err(e) => {
+                        println!("{}", Red.paint(format!("Error: {}", e)));
+                        continue;
+                    }
+                };
 
-            let value_type = match choice {
-                1 => ValueType::Byte,
-                2 => ValueType::Word,
-                3 => ValueType::Dword,
-                4 => ValueType::Qword,
-                5 => ValueType::Float,
-                6 => ValueType::Double,
-                7 => ValueType::String,
-                _ => {
-                    println!("{}", Red.paint("Invalid choice. Please try again."));
-                    continue;
+                let value_type = match choice {
+                    1 => ValueType::Byte,
+                    2 => ValueType::Word,
+                    3 => ValueType::Dword,
+                    4 => ValueType::Qword,
+                    5 => ValueType::Float,
+                    6 => ValueType::Double,
+                    7 => ValueType::String,
+                    _ => {
+                        println!("{}", Red.paint("Invalid choice. Please try again."));
+                        continue;
+                    }
+                };
+
+                print!("Enter the value to scan for: ");
+                io::stdout().flush().unwrap();
+                let mut input = String::new();
+                io::stdin().read_line(&mut input).unwrap();
+                let value = match value_type {
+                    ValueType::String => input.trim().as_bytes().to_vec(),
+                    ValueType::Float => {
+                        match input.trim().parse::<f32>() {
+                            Ok(parsed_value) => parsed_value.to_ne_bytes().to_vec(),
+                            Err(_) => {
+                                println!("{}", Red.paint("Invalid float value. Please try again."));
+                                continue;
+                            }
+                        }
+                    },
+                    ValueType::Double => {
+                        match input.trim().parse::<f64>() {
+                            Ok(parsed_value) => parsed_value.to_ne_bytes().to_vec(),
+                            Err(_) => {
+                                println!("{}", Red.paint("Invalid double value. Please try again."));
+                                continue;
+                            }
+                        }
+                    },
+                    ValueType::Byte => {
+                        match input.trim().parse::<u8>() {
+                            Ok(parsed_value) => vec![parsed_value],
+                            Err(_) => {
+                                println!("{}", Red.paint("Invalid byte value. Please enter a number between 0 and 255."));
+                                continue;
+                            }
+                        }
+                    },
+                    ValueType::Word => {
+                        match input.trim().parse::<u16>() {
+                            Ok(parsed_value) => parsed_value.to_ne_bytes().to_vec(),
+                            Err(_) => {
+                                println!("{}", Red.paint("Invalid word value. Please enter a number between 0 and 65535."));
+                                continue;
+                            }
+                        }
+                    },
+                    ValueType::Dword => {
+                        match input.trim().parse::<u32>() {
+                            Ok(parsed_value) => parsed_value.to_ne_bytes().to_vec(),
+                            Err(_) => {
+                                println!("{}", Red.paint("Invalid dword value. Please enter a number between 0 and 4294967295."));
+                                continue;
+                            }
+                        }
+                    },
+                    ValueType::Qword => {
+                        match input.trim().parse::<u64>() {
+                            Ok(parsed_value) => parsed_value.to_ne_bytes().to_vec(),
+                            Err(_) => {
+                                println!("{}", Red.paint("Invalid qword value. Please enter a number."));
+                                continue;
+                            }
+                        }
+                    },
+                };
+
+                let addresses = scan_memory(process_handle, value_type, &value);
+                println!("Found {} matches:", Yellow.paint(addresses.len().to_string()));
+                for address in &addresses {
+                    println!("Address: {}", Cyan.paint(format!("0x{:X}", address)));
                 }
-            };
 
-            print!("Enter the value to scan for: ");
-            io::stdout().flush().unwrap();
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).unwrap();
-            let value = input.trim().as_bytes().to_vec();
+                let continue_scan: String = match get_user_input("Do you want to scan again? (y/n): ") {
+                    Ok(answer) => answer,
+                    Err(e) => {
+                        println!("{}", Red.paint(format!("Error: {}", e)));
+                        break;
+                    }
+                };
 
-            let addresses = scan_memory(process_handle, value_type, &value);
-            println!("Found {} matches:", Yellow.paint(addresses.len().to_string()));
-            for address in &addresses {
-                println!("Address: {}", Cyan.paint(format!("0x{:X}", address)));
+                if continue_scan.to_lowercase() != "y" {
+                    break;
+                }
             }
 
-            print!("Do you want to scan again? (y/n): ");
-            io::stdout().flush().unwrap();
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).unwrap();
-            if input.trim().to_lowercase() != "y" {
-                break;
+            unsafe {
+                winapi::um::handleapi::CloseHandle(process_handle);
             }
         }
-
-        unsafe {
-            winapi::um::handleapi::CloseHandle(process_handle);
+        Err(e) => {
+            println!("{}", Red.paint(format!("Failed to open process: {}", e)));
         }
-    } else {
-        println!("{}", Red.paint("Failed to open process."));
     }
 }
