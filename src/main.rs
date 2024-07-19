@@ -6,6 +6,8 @@ use std::io::{self, Write};
 use std::mem;
 use std::os::raw::c_char;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use winapi::shared::minwindef::DWORD;
 use winapi::um::handleapi::INVALID_HANDLE_VALUE;
 use winapi::um::memoryapi::{ReadProcessMemory, VirtualQueryEx};
@@ -228,6 +230,13 @@ fn get_user_input<T: std::str::FromStr>(prompt: &str) -> Result<T, String> {
 }
 
 fn main() {
+    let running = Arc::new(AtomicBool::new(true));
+    let r = Arc::clone(&running);
+
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    }).expect("Error setting Ctrl-C handler");
+
     let processes = enumerate_processes();
     println!("{}", Style::new().bold().fg(Blue).paint("Processes:"));
     for (pid, name) in &processes {
@@ -246,7 +255,7 @@ fn main() {
         Ok(process_handle) => {
             println!("{}", Green.paint("Process opened successfully."));
 
-            loop {
+            while running.load(Ordering::SeqCst) {
                 println!("\n{}", Style::new().bold().fg(Blue).paint("Select the value type to scan for:"));
                 println!("1. Byte");
                 println!("2. Word (2 bytes)");
